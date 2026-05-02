@@ -31,6 +31,7 @@ from pytraceview.draw_mode    import (
 from pytraceview.render_utils import DEFAULT_LIMITS_CONFIG
 from pytraceview.plot_widget  import TraceView
 from pytraceview.channel_widget import ChannelListWidget, ChannelRow
+from pytraceview.grouping_dialog import GroupingDialog
 
 __all__ = [
     "PlotTheme", "DEFAULT_PLOT_THEME",
@@ -41,4 +42,5 @@ __all__ = [
     "DEFAULT_LIMITS_CONFIG",
     "TraceView",
     "ChannelListWidget", "ChannelRow",
+    "GroupingDialog",
 ]
