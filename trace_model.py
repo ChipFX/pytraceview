@@ -2,17 +2,21 @@
 pytraceview/trace_model.py
 Data model for a single signal trace/channel.
 
-Scaling pipeline (applied in order):
-  raw_data  -> gain -> offset -> display as processed_data
+Every trace owns one or more Segment objects.  A Segment holds its own
+raw data array, time axis, wall-clock anchor, and optional filter result.
+There are no flat inter-segment concatenations anywhere in this module.
 
-Filters are non-destructive: raw_data is never touched by filters.
-filter_data holds the filtered result; processed_data returns
-filter_data if a filter is active, otherwise the gain+offset result.
+Scaling pipeline per segment:
+  Segment.data  →  ScalingConfig.apply()  →  scaled output
+                    (or Segment.filtered_data if a filter is active)
+
+Callers that need a single array use trace.primary() to get the active
+segment, then trace.segment_processed(seg) for the scaled result.
 """
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -47,124 +51,197 @@ class ScalingConfig:
 
 
 @dataclass
-class TraceModel:
-    name: str
-    raw_data: np.ndarray
-    time_data: Optional[np.ndarray] = None
-    sample_rate: float = 1.0
-    dt: float = 1.0
+class Segment:
+    """One contiguous capture block within a trace.
 
-    color: str = "#F0C040"
-    visible: bool = True
-    label: str = ""
-    unit: str = "V"
-    theme_color_index: int = 0
-    use_theme_color: bool = True
+    A trace always has at least one Segment.  Multi-trigger captures
+    (oscilloscope, LeCroy), sweep histories (VNA), and live DAQ scans
+    each map naturally to one Segment per acquisition event.
+
+    Time and data are always pre-computed — no lazy generation from
+    sample_rate.  The caller (importer, live source) builds both arrays
+    explicitly before constructing the Segment.
+
+    filtered_data is set per-segment by set_filter() on the owning
+    TraceModel.  The filter runs independently on each segment so that
+    IIR state never bleeds across acquisition boundaries.
+    """
+    data:          np.ndarray               # raw samples
+    time:          np.ndarray               # pre-computed time axis, same length as data
+    t0_absolute:   float = 0.0             # Unix epoch of first sample in this segment
+    t0_relative:   float = 0.0             # seconds since segments[0].t0_absolute
+    sample_rate:   float = 1.0             # samples per second
+    label:         str   = ""              # optional annotation (e.g. "Trigger 3")
+    filtered_data: Optional[np.ndarray] = field(default=None, repr=False)
+
+
+@dataclass
+class TraceModel:
+    """Data model for one signal channel.
+
+    Segments are the authoritative data source.  There are no flat
+    concatenated arrays on this class; callers address segments directly.
+
+    Minimal construction (single capture):
+        seg = Segment(data=y, time=t, t0_absolute=time.time(), sample_rate=1e3)
+        trace = TraceModel(name="Ch1", segments=[seg])
+    """
+
+    name: str
+    segments: List[Segment]    # always populated; minimum one element
+
+    # ── Display / palette ─────────────────────────────────────────────
+    color:             str  = "#F0C040"
+    visible:           bool = True
+    label:             str  = ""
+    unit:              str  = "V"
+    theme_color_index: int  = 0
+    use_theme_color:   bool = True
 
     scaling: ScalingConfig = field(default_factory=ScalingConfig)
 
-    # Display state
-    y_offset: float = 0.0
-    y_scale: float = 1.0
-    display_row: int = 0
+    # ── Display state ─────────────────────────────────────────────────
+    y_offset:    float = 0.0
+    y_scale:     float = 1.0
+    display_row: int   = 0
 
-    # Instrument metadata (from CSV headers or binary import)
-    coupling: str = ""
+    # ── Instrument metadata ───────────────────────────────────────────
+    coupling:  str = ""
     impedance: str = ""
-    bwlimit: str = ""
+    bwlimit:   str = ""
 
     # ── Source provenance ─────────────────────────────────────────────
-    # Set at import time; readable by trace-manipulation plugins via the
-    # traces list that gets passed to plugin.run().
-
-    # Filename the trace was loaded from (basename only)
-    source_file: str = ""
-
-    # Column name exactly as it appeared in the source CSV header row,
-    # before any display-name override from a parser plugin or the user.
+    source_file:       str = ""
     original_col_name: str = ""
+    col_group:         str = ""
 
-    # Parser-assigned group name (e.g. "Measurements", "Alarms", "Temperature").
-    # Empty string if no grouping was provided.
-    col_group: str = ""
-
-    # ── Wall-clock time anchor ────────────────────────────────────────
-    # ISO 8601 string for the real-world moment that corresponds to t=0 on
-    # this trace's time axis.  Empty string if unknown.
-    #
-    # Examples:
-    #   Scope capture  → trigger time, e.g. "2002-03-23T02:21:36"
-    #   Data logger    → timestamp of the first imported sample
-    #
-    # When the user performs "Set t=0 here" (cursor or sample index), the
-    # pipeline shifts time_data and updates t0_wall_clock by the same delta
-    # so the real-world calendar time remains consistent.
-    #
-    # The cursor UI uses:  t0_wall_clock_as_datetime + timedelta(seconds=cursor_t)
-    # to show "Thursday 12 April 2026  13:44:22.460"
-    t0_wall_clock: str = ""
-
-    # Describes how the time axis was sourced; informational for plugins / UI.
-    #   "seconds_relative"      — float seconds from t=0, kept as-is
-    #   "unix_epoch"            — was Unix epoch; converted to seconds_relative
-    #   "datetime:<strptime>"   — was datetime strings; converted to seconds_relative
+    # Informational: how the time axis was originally sourced.
+    #   "seconds_relative" — float seconds from t=0
+    #   "unix_epoch"       — was Unix epoch; converted at import time
+    #   "datetime:<fmt>"   — was datetime strings; converted at import time
     source_time_format: str = "seconds_relative"
 
-    # ── Segment metadata ──────────────────────────────────────────────
-    # Populated by importers that support multi-segment captures (e.g. LeCroy).
-    # Each tuple: (start_index, end_index, t0_absolute, t0_relative)
-    #   start_index  : int   — inclusive 0-based index into time_data / raw_data
-    #   end_index    : int   — exclusive end index (Python slice convention)
-    #   t0_absolute  : float — Unix timestamp of this segment's trigger
-    #   t0_relative  : float — seconds since segment-1 trigger (0.0 for seg 1)
-    # None means non-segmented or unknown — all code that doesn't know about
-    # segments should treat None as "no special handling required".
-    segments: Optional[list] = None        # list[tuple[int,int,float,float]] | None
-    primary_segment: Optional[int] = None  # 0-based index into segments; None = all equal
+    # ── Time shift ────────────────────────────────────────────────────
+    # Applied additively when reading segment times:  t_display = seg.time + time_offset
+    # "Set t=0 here" → time_offset -= cursor_t
+    # "Restore t=0"  → time_offset  = 0.0
+    time_offset: float = 0.0
 
-    # How non-primary segments are rendered.  Empty string = default behaviour
-    # (treated as "regular" until the GUI segment controls are implemented).
-    # Valid values: "show_only_primary", "dimmed", "dashed", "regular"
+    # ── Segment display control ───────────────────────────────────────
+    # primary_segment: index of the segment shown as the main curve, or
+    # None meaning all segments are treated equally (no primary).
+    primary_segment:     Optional[int] = None
+    # How non-primary segments are rendered when primary_segment is set.
+    # Values: "dimmed" | "dashed" | "hide" | "" (default = "dimmed")
     non_primary_viewmode: str = ""
 
-    # Per-trace labels: list of (time_position, label_text) tuples
-    # Each label is drawn as a text annotation anchored to that time point.
+    # ── Per-trace annotations ─────────────────────────────────────────
+    # list of (time_position, label_text) drawn on the plot
     trace_labels: list = field(default_factory=list)
 
-    # Set by retrigger pipeline when the averaged/interpolated curve
-    # extends outside the original capture's time bounds.
+    # ── Retrigger flag ────────────────────────────────────────────────
     retrigger_extrapolating: bool = False
 
-    # Periodicity estimate — computed on load by a periodicity analyser.
-    # 0.0 means unknown (estimation disabled, failed, or not yet run).
-    # period_confidence is 0.0–1.0; values below ~0.3 should be treated
-    # with scepticism.  Both fields are read-only to plugins.
-    period_estimate:    float = 0.0
-    period_confidence:  float = 0.0
-    period_estimation_attempted: bool = False
+    # ── Periodicity estimate ──────────────────────────────────────────
+    period_estimate:             float = 0.0
+    period_confidence:           float = 0.0
+    period_estimation_attempted: bool  = False
 
-    # ── Original time-zero anchor ─────────────────────────────────────
-    # Set once at import time to time_axis[0] and never changed.
-    # Used by the "Restore original t=0" button to undo any t=0 shifts.
-    # None means the trace was created before this field existed (safe to skip).
-    original_time_zero: Optional[float] = None
+    # ── Filter description ────────────────────────────────────────────
+    # The result lives in each Segment.filtered_data; this string
+    # describes what filter was applied (e.g. "LP Butter 1 kHz").
+    _filter_desc: str = field(default="", repr=False)
 
-    # Non-destructive filter result (None = no filter active)
-    _filter_data: Optional[np.ndarray] = field(default=None, repr=False)
-    _filter_desc: str = field(default="", repr=False)  # e.g. "LP 1kHz"
-
-    # Cache
-    _processed_data: Optional[np.ndarray] = field(default=None, repr=False)
-    _computed_time: Optional[np.ndarray] = field(default=None, repr=False)
+    # ── Internal cache ────────────────────────────────────────────────
+    _processed_data_cache: Optional[np.ndarray] = field(default=None, repr=False)
 
     def __post_init__(self):
         if not self.label:
             self.label = self.name
-        self._invalidate_cache()
 
-    def _invalidate_cache(self):
-        self._processed_data = None
-        self._computed_time = None
+    # ── Primary segment accessor ──────────────────────────────────────
+
+    def primary(self) -> Segment:
+        """Return the active (or only) segment.
+
+        Code that legitimately needs one contiguous array — FFT, trigger
+        detection, periodicity — calls this explicitly rather than
+        receiving a hidden flat concatenation.
+        """
+        idx = self.primary_segment if self.primary_segment is not None else 0
+        return self.segments[idx]
+
+    # ── Scaled data ───────────────────────────────────────────────────
+
+    def segment_processed(self, seg: Segment) -> np.ndarray:
+        """Return scaled data for one segment (filtered if active, else raw)."""
+        src = seg.filtered_data if seg.filtered_data is not None else seg.data
+        return self.scaling.apply(src)
+
+    # ── Filter ────────────────────────────────────────────────────────
+
+    def set_filter(self, filtered_per_segment: list, description: str = ""):
+        """Store per-segment filter results.
+
+        filtered_per_segment must be a list matching len(self.segments).
+        Each element is an np.ndarray (same length as the segment's data)
+        or None (segment not filtered, e.g. too short for the filter order).
+
+        The filter is run independently on each segment so that IIR
+        state never bleeds across acquisition boundaries.
+        """
+        for seg, fdata in zip(self.segments, filtered_per_segment):
+            seg.filtered_data = fdata
+        self._filter_desc = description
+
+    def clear_filter(self):
+        for seg in self.segments:
+            seg.filtered_data = None
+        self._filter_desc = ""
+
+    @property
+    def has_filter(self) -> bool:
+        return any(s.filtered_data is not None for s in self.segments)
+
+    @property
+    def filter_description(self) -> str:
+        return self._filter_desc
+
+    # ── Windowed data (primary segment) ───────────────────────────────
+
+    def windowed_data(self, t_start: float, t_end: float):
+        """Return (time, scaled_data) for the primary segment, masked to [t_start, t_end].
+
+        Used by FFT dialog and analysis plugins that operate on one
+        contiguous time window.  Applies time_offset before masking.
+        """
+        seg  = self.primary()
+        t    = seg.time + self.time_offset
+        y    = self.segment_processed(seg)
+        mask = (t >= t_start) & (t <= t_end)
+        return t[mask], y[mask]
+
+    # ── Convenience metrics ───────────────────────────────────────────
+
+    @property
+    def duration(self) -> float:
+        """Total duration across all segments in seconds."""
+        return sum(
+            (float(s.time[-1]) - float(s.time[0]))
+            for s in self.segments if len(s.time) > 1
+        )
+
+    @property
+    def n_samples(self) -> int:
+        """Total sample count across all segments."""
+        return sum(len(s.data) for s in self.segments)
+
+    # ── Scaling ───────────────────────────────────────────────────────
+
+    def update_scaling(self, scaling: ScalingConfig):
+        self.scaling = scaling
+
+    # ── Color management ──────────────────────────────────────────────
 
     def set_user_color(self, color: str):
         self.color = color
@@ -179,69 +256,3 @@ class TraceModel:
         if self.use_theme_color:
             self.color = theme.trace_color(self.theme_color_index)
         return self.color
-
-    @property
-    def processed_data(self) -> np.ndarray:
-        """Returns filtered data if a filter is active, else scaled raw data."""
-        if self._processed_data is None:
-            if self._filter_data is not None:
-                self._processed_data = self._filter_data
-            else:
-                self._processed_data = self.scaling.apply(self.raw_data)
-        return self._processed_data
-
-    @property
-    def time_axis(self) -> np.ndarray:
-        if self._computed_time is None:
-            if self.time_data is not None:
-                self._computed_time = self.time_data
-            else:
-                n = len(self.raw_data)
-                t0_off = getattr(self, '_t0_sample_offset', 0)
-                self._computed_time = (np.arange(n) - t0_off) * self.dt
-        return self._computed_time
-
-    def set_sample_rate(self, sps: float):
-        self.sample_rate = sps
-        self.dt = 1.0 / sps if sps != 0 else 1.0
-        self._computed_time = None
-
-    def set_dt(self, dt: float):
-        self.dt = dt
-        self.sample_rate = 1.0 / dt if dt != 0 else 1.0
-        self._computed_time = None
-
-    def update_scaling(self, scaling: ScalingConfig):
-        self.scaling = scaling
-        self._invalidate_cache()
-
-    def set_filter(self, filtered_data: Optional[np.ndarray], description: str = ""):
-        """Apply a non-destructive filter. Pass None to clear."""
-        self._filter_data = filtered_data
-        self._filter_desc = description
-        self._processed_data = None  # invalidate display cache only
-
-    def clear_filter(self):
-        self.set_filter(None)
-
-    @property
-    def has_filter(self) -> bool:
-        return self._filter_data is not None
-
-    @property
-    def filter_description(self) -> str:
-        return self._filter_desc
-
-    @property
-    def duration(self) -> float:
-        t = self.time_axis
-        return (t[-1] - t[0]) if len(t) > 1 else 0.0
-
-    @property
-    def n_samples(self) -> int:
-        return len(self.raw_data)
-
-    def windowed_data(self, t_start: float, t_end: float):
-        t = self.time_axis
-        mask = (t >= t_start) & (t <= t_end)
-        return t[mask], self.processed_data[mask]

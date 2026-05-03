@@ -332,14 +332,11 @@ class TraceLane(pg.PlotWidget):
             self.trace, self._process_segments)
         self._sinc_active = False
 
-        # Determine segment processing state.
-        # primary_segment=None means no explicit primary; per spec this is
-        # equivalent to "show all segments as regular" — no slicing or styling.
-        segs = getattr(self.trace, 'segments', None)
-        primary = getattr(self.trace, 'primary_segment', None)
-        viewmode = (getattr(self.trace, 'non_primary_viewmode', '') or '').strip()
+        segs = self.trace.segments
+        primary = self.trace.primary_segment
+        viewmode = (self.trace.non_primary_viewmode or '').strip()
         process_segs = (self._process_segments
-                        and segs is not None and len(segs) > 1
+                        and len(segs) > 1
                         and primary is not None and 0 <= primary < len(segs))
         # Window to the currently visible x-range FIRST — for all interp modes.
         # Downsampling must operate on visible samples only; applying it to the
@@ -377,23 +374,17 @@ class TraceLane(pg.PlotWidget):
             # Always keep main curve above all persistence ghost layers
             self._curve.setZValue(len(self._persist_curves) + 1)
 
-        # Non-primary segment overlays
+        # Non-primary segment overlays — iterate Segment objects directly
+        width_px = float(self.getPlotItem().vb.width())
+        seg_max_pts = _resolve_display_limit(self._limits_config, width_px)
         if process_segs and viewmode != "hide":
-            t_all = self.trace.time_axis
-            y_all = self.trace.processed_data
             color = self._display_color()
-            width_px = float(self.getPlotItem().vb.width())
-            seg_max_pts = _resolve_display_limit(self._limits_config, width_px)
             for i, seg in enumerate(segs):
                 if i == primary:
                     continue
-                s_s, s_e = seg[0], seg[1]
-                t_seg = t_all[s_s:s_e]
-                y_seg = y_all[s_s:s_e]
-                seg_mask = (t_seg >= x0) & (t_seg <= x1)
-                if int(seg_mask.sum()) >= 2:
-                    t_seg = t_seg[seg_mask]
-                    y_seg = y_seg[seg_mask]
+                t_seg = seg.time + self.trace.time_offset
+                y_seg = self.trace.segment_processed(seg)
+                t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
                 if len(t_seg) < 2:
                     continue
                 t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
@@ -411,6 +402,24 @@ class TraceLane(pg.PlotWidget):
                 else:
                     seg_pen = pg.mkPen(color=color, width=1)
                 sc = self.plot(t_ds, y_ds, pen=seg_pen, antialias=False)
+                sc.setDownsampling(auto=True, method="peak")
+                sc.setClipToView(True)
+                self._segment_curves.append(sc)
+        elif not process_segs and len(segs) > 1:
+            # Segment display disabled — render remaining segments with normal style
+            rendered_idx = primary if primary is not None else 0
+            color = self._display_color()
+            normal_pen = pg.mkPen(color=color, width=1.5)
+            for i, seg in enumerate(segs):
+                if i == rendered_idx:
+                    continue
+                t_seg = seg.time + self.trace.time_offset
+                y_seg = self.trace.segment_processed(seg)
+                t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
+                if len(t_seg) < 2:
+                    continue
+                t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
+                sc = self.plot(t_ds, y_ds, pen=normal_pen, antialias=False)
                 sc.setDownsampling(auto=True, method="peak")
                 sc.setClipToView(True)
                 self._segment_curves.append(sc)
@@ -468,11 +477,12 @@ class TraceLane(pg.PlotWidget):
             self._cursors[cursor_id].blockSignals(False)
 
     def get_value_at(self, t_pos):
-        return _interpolated_trace_value(
-            self.trace.time_axis,
-            self.trace.processed_data,
-            t_pos,
-        )
+        for seg in self.trace.segments:
+            t = seg.time + self.trace.time_offset
+            if len(t) >= 2 and float(t[0]) <= t_pos <= float(t[-1]):
+                return _interpolated_trace_value(
+                    t, self.trace.segment_processed(seg), t_pos)
+        return None
 
     # ── Persistence / retrigger overlay ───────────────────────────────────────
 
@@ -743,12 +753,11 @@ class OverlayTraceVisual:
             self.trace, self._process_segments)
         x0, x1 = view_range
 
-        # Segment slicing — mirrors TraceLane._add_trace_curve logic
-        segs = getattr(self.trace, 'segments', None)
-        primary = getattr(self.trace, 'primary_segment', None)
-        viewmode = (getattr(self.trace, 'non_primary_viewmode', '') or '').strip()
+        segs = self.trace.segments
+        primary = self.trace.primary_segment
+        viewmode = (self.trace.non_primary_viewmode or '').strip()
         process_segs = (self._process_segments
-                        and segs is not None and len(segs) > 1
+                        and len(segs) > 1
                         and primary is not None and 0 <= primary < len(segs))
         self._interpolated_view = False
         self._update_visible_samples(RenderViewport(
@@ -788,22 +797,16 @@ class OverlayTraceVisual:
         if self._persist_curves:
             self.curve.setZValue(len(self._persist_curves) + 1)
 
-        # Non-primary segment overlays
+        # Non-primary segment overlays — iterate Segment objects directly
+        seg_max_pts = _resolve_display_limit(self._limits_config, width_px)
         if process_segs and viewmode != "hide":
-            t_all = self.trace.time_axis
-            y_all = self.trace.processed_data
             color = self._display_color()
-            seg_max_pts = _resolve_display_limit(self._limits_config, width_px)
             for i, seg in enumerate(segs):
                 if i == primary:
                     continue
-                s_s, s_e = seg[0], seg[1]
-                t_seg = t_all[s_s:s_e]
-                y_seg = y_all[s_s:s_e]
-                seg_mask = (t_seg >= x0) & (t_seg <= x1)
-                if int(seg_mask.sum()) >= 2:
-                    t_seg = t_seg[seg_mask]
-                    y_seg = y_seg[seg_mask]
+                t_seg = seg.time + self.trace.time_offset
+                y_seg = self.trace.segment_processed(seg)
+                t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
                 if len(t_seg) < 2:
                     continue
                 t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
@@ -821,6 +824,23 @@ class OverlayTraceVisual:
                 else:
                     seg_pen = pg.mkPen(color=color, width=1)
                 sc = self.plot_item.plot(t_ds, y_ds, pen=seg_pen, antialias=False)
+                sc.setDownsampling(auto=True, method="peak")
+                sc.setClipToView(True)
+                self._segment_curves.append(sc)
+        elif not process_segs and len(segs) > 1:
+            rendered_idx = primary if primary is not None else 0
+            color = self._display_color()
+            normal_pen = pg.mkPen(color=color, width=1.5)
+            for i, seg in enumerate(segs):
+                if i == rendered_idx:
+                    continue
+                t_seg = seg.time + self.trace.time_offset
+                y_seg = self.trace.segment_processed(seg)
+                t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
+                if len(t_seg) < 2:
+                    continue
+                t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
+                sc = self.plot_item.plot(t_ds, y_ds, pen=normal_pen, antialias=False)
                 sc.setDownsampling(auto=True, method="peak")
                 sc.setClipToView(True)
                 self._segment_curves.append(sc)

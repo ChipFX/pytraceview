@@ -1160,13 +1160,15 @@ class TraceView(QWidget):
                     if v is not None:
                         vals[trace.name] = v
                 else:
-                    v = _interpolated_trace_value(
-                        trace.time_axis,
-                        trace.processed_data,
-                        t_pos,
-                    )
-                    if v is not None:
-                        vals[trace.name] = v
+                    # Overlay mode: search each segment for the cursor position
+                    for seg in trace.segments:
+                        t = seg.time + trace.time_offset
+                        if len(t) >= 2 and float(t[0]) <= t_pos <= float(t[-1]):
+                            v = _interpolated_trace_value(
+                                t, trace.segment_processed(seg), t_pos)
+                            if v is not None:
+                                vals[trace.name] = v
+                            break
             result[cid] = vals
         self.cursor_values_changed.emit(result)
 

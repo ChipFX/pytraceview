@@ -13,9 +13,9 @@ Public API surface:
 Internal helpers (used inside pytraceview only):
   _style_context_from_plot_theme
   _effective_color
-  _trace_primary_segment_points
-  _windowed_render_points
-  _interpolated_trace_value
+  _trace_primary_segment_points  — returns one Segment's display arrays
+  _windowed_render_points        — clips (t, y) to the visible x range
+  _interpolated_trace_value      — linear interp at a cursor position
   _resolve_display_limit
   _upsample_for_display
 """
@@ -32,7 +32,7 @@ from pytraceview.draw_mode import (
     create_density_estimator,
     resolve_pen_width,
 )
-from pytraceview.trace_model import TraceModel
+from pytraceview.trace_model import TraceModel, Segment
 from pytraceview.plot_theme import PlotTheme, DEFAULT_PLOT_THEME
 
 
@@ -45,7 +45,7 @@ DEFAULT_LIMITS_CONFIG: dict = {
     "scale_min_px":  2,         # window mode — floor: pts = max(preset_min, scale_min * width)
     "scale_max_px":  12,        # window mode — ceiling: pts = scale_max * width
     "preset_min":    2048,      # absolute floor in both modes
-    "preset_max":    50_000,    # preset mode limit (was MAX_DISPLAY_POINTS)
+    "preset_max":    50_000,    # preset mode limit
 }
 
 
@@ -105,7 +105,6 @@ def sinc_interpolate_to_n(t: np.ndarray, y: np.ndarray,
     n = len(y)
     if n < 4 or target_n <= n:
         return t, y
-    # Ceiling division so n_new >= target_n
     upsample = max(2, (target_n + n - 1) // n)
     n_new = n * upsample
     Y = np.fft.rfft(y)
@@ -148,8 +147,7 @@ def _upsample_for_display(
     """Apply sinc/cubic upsampling to a short data segment if needed.
 
     Used for retrigger result curves so they receive the same display
-    interpolation as the raw trace lanes.  The segment is already scoped
-    to the view window, so a simple point-count check is sufficient.
+    interpolation as the raw trace lanes.
     """
     if interp_mode not in ("sinc", "cubic") or len(t) < 4:
         return t, y
@@ -203,21 +201,20 @@ def _trace_primary_segment_points(
         trace: TraceModel,
         process_segments: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return the base source arrays for the trace's active render segment."""
-    t_points = trace.time_axis
-    y_points = trace.processed_data
-    segs = getattr(trace, "segments", None)
-    primary = getattr(trace, "primary_segment", None)
-    process_segs = (
-        process_segments
-        and segs is not None and len(segs) > 1
-        and primary is not None and 0 <= primary < len(segs)
-    )
-    if process_segs:
-        start, end = segs[primary][0], segs[primary][1]
-        t_points = t_points[start:end]
-        y_points = y_points[start:end]
-    return t_points, y_points
+    """Return (time, scaled_data) for the segment used as the main render curve.
+
+    When process_segments=True and primary_segment is set, returns that
+    specific segment.  Otherwise returns segments[0] — which is the whole
+    trace for single-segment captures, or the fallback when segment
+    differentiation is disabled.
+
+    time_offset is applied here so all callers get display-ready time values.
+    """
+    if process_segments and trace.primary_segment is not None:
+        seg = trace.segments[trace.primary_segment]
+    else:
+        seg = trace.segments[0]
+    return seg.time + trace.time_offset, trace.segment_processed(seg)
 
 
 def _windowed_render_points(
@@ -238,7 +235,7 @@ def _interpolated_trace_value(
         y_points: np.ndarray,
         t_pos: float,
 ) -> Optional[float]:
-    """Return the interpolated trace value at t_pos, clamping to endpoints."""
+    """Return the interpolated trace value at t_pos within one segment's arrays."""
     if len(t_points) < 2:
         return None
     if t_pos < float(t_points[0]) or t_pos > float(t_points[-1]):
