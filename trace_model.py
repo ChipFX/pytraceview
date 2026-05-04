@@ -159,6 +159,24 @@ class TraceModel:
         if not self.label:
             self.label = self.name
 
+    # ── Convenience accessors ─────────────────────────────────────────
+
+    @property
+    def sample_rate(self) -> float:
+        """Sample rate of the primary segment.
+
+        Convenience proxy so callers don't have to write
+        trace.primary().sample_rate everywhere.  Avoids precision loss
+        from repeated dt=1/sps → sps=1/dt round-trips.
+        """
+        return self.primary().sample_rate
+
+    @property
+    def dt(self) -> float:
+        """Sample interval (1/sample_rate) of the primary segment."""
+        sps = self.primary().sample_rate
+        return 1.0 / sps if sps > 0 else 1.0
+
     # ── Primary segment accessor ──────────────────────────────────────
 
     def primary(self) -> Segment:
