@@ -41,17 +41,19 @@ from pytraceview.grouping_dialog import GroupingDialog
 
 
 class _TooltipFilter(QObject):
-    """Intercepts ToolTip events to set palette immediately before display.
+    """Intercepts ToolTip events to render themed HTML table tooltips.
 
-    Qt inherits the widget's own background-color into QToolTip regardless of
-    any QToolTip stylesheet rules.  Calling QToolTip.setPalette() + showText()
-    inside the event handler is the only reliable way to override this.
-    bg_fn and text_fn are callables so they always return the current value.
+    Qt inherits the triggering widget's background-color into the tooltip
+    window, so widgets with 'background: transparent' stylesheets produce a
+    dark border.  widget_fn lets callers supply a stylesheet-free widget as
+    the showText() context instead of the event target.
+    bg_fn, text_fn, and widget_fn are callables — always current at fire time.
     """
-    def __init__(self, bg_fn, text_fn, parent=None):
+    def __init__(self, bg_fn, text_fn, parent=None, widget_fn=None):
         super().__init__(parent)
-        self._bg_fn   = bg_fn
-        self._text_fn = text_fn
+        self._bg_fn     = bg_fn
+        self._text_fn   = text_fn
+        self._widget_fn = widget_fn   # if None, uses the event target (obj)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.ToolTip:
@@ -60,14 +62,11 @@ class _TooltipFilter(QObject):
                 return False
             bg   = self._bg_fn()
             fg   = self._text_fn()
-            # HTML table tooltip: Qt's rich-text renderer respects the table
-            # cell's background-color, filling the content area regardless of
-            # the palette or platform style.  This bypasses the QPalette /
-            # QToolTip stylesheet route that Qt 6.7+ ignores on Windows 11.
             html = (f'<table cellspacing="0" cellpadding="3"'
                     f' style="background-color:{bg}; margin:0px;">'
                     f'<tr><td style="color:{fg};">{tip}</td></tr></table>')
-            QToolTip.showText(event.globalPos(), html, obj)
+            show_w = self._widget_fn() if self._widget_fn else obj
+            QToolTip.showText(event.globalPos(), html, show_w)
             return True
         return False
 
@@ -325,7 +324,7 @@ class _ChannelGroupHeader(QWidget):
         "QPushButton:hover {{ color: {hfg}; }}")
 
     def __init__(self, group_name: str, rows_ref: list,
-                 on_toggle_collapse, parent=None):
+                 on_toggle_collapse, parent=None, tooltip_parent=None):
         super().__init__(parent)
         self.group_name   = group_name
         self._rows_ref    = rows_ref           # shared list; populated after creation
@@ -366,15 +365,19 @@ class _ChannelGroupHeader(QWidget):
         hl.addWidget(self._btn_none)
 
         # Tooltip colours for this header — updated in set_accent_color.
-        self._tip_bg   = "#0d0d0d"
-        self._tip_text = "#e0e0e0"
+        # tooltip_parent should be a widget with no stylesheet (e.g. the
+        # ChannelPanel) so Qt doesn't inherit a transparent background into
+        # the tooltip window and produce a dark border.
+        self._tip_bg     = "#0d0d0d"
+        self._tip_text   = "#e0e0e0"
+        self._tip_parent = tooltip_parent
         self._btn_all_tip_filter = _TooltipFilter(
             bg_fn=lambda: self._tip_bg, text_fn=lambda: self._tip_text,
-            parent=self)
+            widget_fn=lambda: self._tip_parent, parent=self)
         self._btn_all.installEventFilter(self._btn_all_tip_filter)
         self._btn_none_tip_filter = _TooltipFilter(
             bg_fn=lambda: self._tip_bg, text_fn=lambda: self._tip_text,
-            parent=self)
+            widget_fn=lambda: self._tip_parent, parent=self)
         self._btn_none.installEventFilter(self._btn_none_tip_filter)
 
         # Apply default accent (overwritten by panel's set_palette immediately)
@@ -613,7 +616,8 @@ class ChannelPanel(QWidget):
             self._group_hdr_rows[group] = []
         hdr_widget = _ChannelGroupHeader(
             group, self._group_hdr_rows[group],
-            on_toggle_collapse=self._on_group_collapse)
+            on_toggle_collapse=self._on_group_collapse,
+            tooltip_parent=self)
         hdr_widget.rename_requested.connect(self._on_group_rename)
         hdr_widget.change_all_units_requested.connect(self._on_group_change_units)
         hdr_widget.move_up_requested.connect(lambda g: self._move_group(g, -1))
