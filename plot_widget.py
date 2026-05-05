@@ -375,10 +375,10 @@ class TraceView(QWidget):
 
     def get_x_axis_item(self):
         """Return the active bottom X-axis item for status/tick inspection."""
-        if self._lanes:
-            return next(iter(self._lanes.values())).getPlotItem().getAxis("bottom")
         if self._mode == "overlay":
             return self._overlay_widget.getPlotItem().getAxis("bottom")
+        if self._lanes:
+            return next(iter(self._lanes.values())).getPlotItem().getAxis("bottom")
         return None
 
     def overlay_plot_item(self):
