@@ -321,7 +321,8 @@ class _ChannelGroupHeader(QWidget):
 
     # ── Theme ─────────────────────────────────────────────────────────────────
 
-    def set_accent_color(self, accent: str, bg: str = "#0d0d0d"):
+    def set_accent_color(self, accent: str, bg: str = "#0d0d0d",
+                         text: str = "#e0e0e0"):
         """Repaint the header using theme colours — no hardcoded values.
 
         Background = theme accent colour, painted at the QListWidgetItem level
@@ -332,6 +333,8 @@ class _ChannelGroupHeader(QWidget):
         Text/arrow = theme background colour (natural contrast on the accent).
         Bottom border = slightly darker accent (visual floor between header
         and the first member row below it).
+        Tooltips = theme text on theme bg (QToolTip rule must be on the button
+        itself, not the parent, to override the app palette reliably).
         """
         darker = QColor(accent).darker(150)
         # Widget is transparent — item-level brush provides the background.
@@ -344,10 +347,15 @@ class _ChannelGroupHeader(QWidget):
                      "background: transparent; border: none;")
         self._lbl_arrow.setStyleSheet(arrow_css)
         self._lbl_name.setStyleSheet(text_css)
+        # QToolTip rule on the button's own stylesheet reliably overrides the
+        # app palette for that button's tooltip.  Use theme text/bg so the
+        # tooltip matches every other tooltip in the application.
+        tooltip_css = (f" QToolTip {{ color: {text}; background-color: {bg};"
+                       " border: 1px solid rgba(128,128,128,160); padding: 2px; }}")
         self._btn_all.setStyleSheet(
-            self._BTN.format(fs=13, fg=bg, hfg=accent))
+            self._BTN.format(fs=13, fg=bg, hfg=accent) + tooltip_css)
         self._btn_none.setStyleSheet(
-            self._BTN.format(fs=13, fg=bg, hfg=accent))
+            self._BTN.format(fs=13, fg=bg, hfg=accent) + tooltip_css)
 
     # ── Click handling ────────────────────────────────────────────────────────
 
@@ -551,7 +559,8 @@ class ChannelPanel(QWidget):
             self._delete_group_and_channels)
         hdr_widget.set_accent_color(
             self._pv.get("accent", "#1e88e5"),
-            self._pv.get("bg", "#0d0d0d"))
+            self._pv.get("bg", "#0d0d0d"),
+            self._pv.get("text", "#e0e0e0"))
         item = QListWidgetItem()
         item.setData(_GROUP_HEADER_ROLE, group)       # marks it as a group header
         item.setSizeHint(QSize(0, 30))
@@ -586,7 +595,8 @@ class ChannelPanel(QWidget):
         for grp_item in self._group_items.values():
             hdr = self._list.itemWidget(grp_item)
             if hdr and hasattr(hdr, "set_accent_color"):
-                hdr.set_accent_color(accent, pv.get("bg", "#0d0d0d"))
+                hdr.set_accent_color(accent, pv.get("bg", "#0d0d0d"),
+                                     pv.get("text", "#e0e0e0"))
         self._update_item_backgrounds()
         self._update_group_separators()
 
@@ -734,66 +744,77 @@ class ChannelPanel(QWidget):
         self.remove_trace(name)
         self.trace_removed.emit(name)
 
-    def _on_rows_moved(self, *args):
-        new_order = self.get_ordered_names()
-        self._trace_order = new_order
+    def _on_rows_moved(self, src_parent, src_start, src_end,
+                       dst_parent, dst_row):
+        # Determine the final position of the moved item.  rowsMoved fires
+        # after Qt has already updated the model; dst_row is pre-removal.
+        count    = src_end - src_start + 1
+        final_pos = dst_row - count if src_start < dst_row else dst_row
 
-        # Walk the list top-to-bottom.  Each group header sets the "current
-        # group"; channel items that no longer match their trace.col_group
-        # have been dragged across a group boundary.
-        current_group = ""
-        membership_changes: List[tuple] = []  # (trace_name, old_group, new_group)
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if item is None:
-                continue
-            grp = item.data(_GROUP_HEADER_ROLE)
-            if grp is not None:
-                current_group = grp
-                continue
-            name = item.data(Qt.ItemDataRole.UserRole)
-            if name is None:
-                continue
-            row = self._rows.get(name)
-            if row is None:
-                continue
-            old_group = row.trace.col_group or ""
-            if old_group != current_group:
-                membership_changes.append((name, old_group, current_group))
+        moved_item = self._list.item(final_pos)
+        if moved_item is None:
+            return
+        name = moved_item.data(Qt.ItemDataRole.UserRole)
+        if name is None:
+            return   # shouldn't happen — only channel items are draggable
+        row = self._rows.get(name)
+        if row is None:
+            return
 
-        for trace_name, old_group, new_group in membership_changes:
-            row = self._rows.get(trace_name)
-            if not row:
+        # Determine the new group by scanning backwards from the moved item.
+        # A floor separator marks the end of a group's territory; hitting one
+        # before a header means the drop landed in ungrouped space.
+        new_group = ""
+        for i in range(final_pos - 1, -1, -1):
+            above = self._list.item(i)
+            if above is None:
                 continue
-            row.trace.col_group = new_group or ""
-            row.set_grouped(bool(new_group))   # update stripe immediately on drop
+            if above.data(_GROUP_SEP_ROLE) is not None:
+                new_group = ""   # landed below a group's floor — ungrouped
+                break
+            g = above.data(_GROUP_HEADER_ROLE)
+            if g is not None:
+                new_group = g
+                break
 
-            # Remove from old group (mutate in place so header _rows_ref stays valid).
-            # Empty groups are intentionally kept — the user may drag channels
-            # back in.  Auto-removal only happens in remove_trace (hard delete).
-            if old_group:
-                names_list = self._group_rows.get(old_group, [])
-                if trace_name in names_list:
-                    names_list.remove(trace_name)
-                hdr_list = self._group_hdr_rows.get(old_group)
-                if hdr_list is not None:
-                    for r in [r for r in hdr_list if r.trace.name == trace_name]:
-                        hdr_list.remove(r)
+        self._trace_order = self.get_ordered_names()
+        old_group = row.trace.col_group or ""
 
-            # Add to new group (mutate in place)
-            if new_group:
-                if new_group not in self._group_rows:
-                    self._group_rows[new_group] = []
-                    self._group_hdr_rows[new_group] = []
-                names_list = self._group_rows[new_group]
-                if trace_name not in names_list:
-                    names_list.append(trace_name)
-                hdr_list = self._group_hdr_rows.get(new_group)
-                if hdr_list is not None and row not in hdr_list:
-                    hdr_list.append(row)
+        if old_group == new_group:
+            self._update_group_visuals()
+            self.order_changed.emit(self._trace_order)
+            return
+
+        # Apply membership change for this item only.  Only the dragged item
+        # changes group; every other item keeps its existing col_group.
+        row.trace.col_group = new_group or ""
+        row.set_grouped(bool(new_group))
+
+        # Remove from old group (mutate in place so header _rows_ref stays valid).
+        # Empty groups are intentionally kept — the user may drag channels back in.
+        if old_group:
+            names_list = self._group_rows.get(old_group, [])
+            if name in names_list:
+                names_list.remove(name)
+            hdr_list = self._group_hdr_rows.get(old_group)
+            if hdr_list is not None:
+                for r in [r for r in hdr_list if r.trace.name == name]:
+                    hdr_list.remove(r)
+
+        # Add to new group (mutate in place).
+        if new_group:
+            if new_group not in self._group_rows:
+                self._group_rows[new_group] = []
+                self._group_hdr_rows[new_group] = []
+            names_list = self._group_rows[new_group]
+            if name not in names_list:
+                names_list.append(name)
+            hdr_list = self._group_hdr_rows.get(new_group)
+            if hdr_list is not None and row not in hdr_list:
+                hdr_list.append(row)
 
         self._update_group_visuals()
-        self.order_changed.emit(new_order)
+        self.order_changed.emit(self._trace_order)
 
     def _delete_group(self, group_name: str):
         """Remove the group header; orphan its channels in place (ungrouped)."""
@@ -1024,27 +1045,49 @@ class ChannelPanel(QWidget):
         if swap_idx < 0 or swap_idx >= len(group_order):
             return
 
-        # Swap the two groups in group_order
-        group_order[idx], group_order[swap_idx] = group_order[swap_idx], group_order[idx]
+        other_group = group_order[swap_idx]
 
-        # Rebuild _trace_order to match new group order.
-        # Collect each group's trace names in their current within-group order.
+        # Build _trace_order as an ordered list of "blocks" so that ungrouped
+        # channels keep their exact positions relative to the groups around them.
+        # A block is either ('group', name) or ('ungrouped', [trace_names]).
+        # Only the two target group blocks are swapped; everything else stays put.
         by_group: Dict[str, List[str]] = {}
-        ungrouped: List[str] = []
+        blocks: List[tuple] = []
+        ungrouped_run: List[str] = []
+        last_group = ""
+
         for n in self._trace_order:
             row = self._rows.get(n)
             if not row:
                 continue
             g = row.trace.col_group or ""
             if g:
+                if ungrouped_run:
+                    blocks.append(('ungrouped', list(ungrouped_run)))
+                    ungrouped_run = []
+                if g != last_group:
+                    blocks.append(('group', g))
+                    last_group = g
                 by_group.setdefault(g, []).append(n)
             else:
-                ungrouped.append(n)
+                last_group = ""
+                ungrouped_run.append(n)
+        if ungrouped_run:
+            blocks.append(('ungrouped', list(ungrouped_run)))
+
+        # Swap only the two group blocks; ungrouped blocks stay in place.
+        swap_positions = [i for i, b in enumerate(blocks)
+                          if b[0] == 'group' and b[1] in (group_name, other_group)]
+        if len(swap_positions) == 2:
+            i, j = swap_positions
+            blocks[i], blocks[j] = blocks[j], blocks[i]
 
         new_trace_order: List[str] = []
-        for g in group_order:
-            new_trace_order.extend(by_group.get(g, []))
-        new_trace_order.extend(ungrouped)
+        for block in blocks:
+            if block[0] == 'group':
+                new_trace_order.extend(by_group.get(block[1], []))
+            else:
+                new_trace_order.extend(block[1])
         self._trace_order = new_trace_order
 
         self._full_rebuild()
