@@ -31,13 +31,45 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QCheckBox, QScrollArea, QMenu, QColorDialog, QSizePolicy,
     QAbstractItemView, QListWidget, QListWidgetItem, QFrame,
-    QDialog,
+    QDialog, QToolTip,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QMimeData, QObject, QEvent, QPoint
 from PyQt6.QtGui import QColor, QFont, QDrag, QPixmap, QPainter, QCursor
 from typing import Dict, List, Set
 from pytraceview.trace_model import TraceModel
 from pytraceview.grouping_dialog import GroupingDialog
+
+
+class _TooltipFilter(QObject):
+    """Intercepts ToolTip events to set palette immediately before display.
+
+    Qt inherits the widget's own background-color into QToolTip regardless of
+    any QToolTip stylesheet rules.  Calling QToolTip.setPalette() + showText()
+    inside the event handler is the only reliable way to override this.
+    bg_fn and text_fn are callables so they always return the current value.
+    """
+    def __init__(self, bg_fn, text_fn, parent=None):
+        super().__init__(parent)
+        self._bg_fn   = bg_fn
+        self._text_fn = text_fn
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.ToolTip:
+            tip = obj.toolTip()
+            if not tip:
+                return False
+            bg   = self._bg_fn()
+            fg   = self._text_fn()
+            # HTML table tooltip: Qt's rich-text renderer respects the table
+            # cell's background-color, filling the content area regardless of
+            # the palette or platform style.  This bypasses the QPalette /
+            # QToolTip stylesheet route that Qt 6.7+ ignores on Windows 11.
+            html = (f'<table cellspacing="0" cellpadding="3"'
+                    f' style="background-color:{bg}; margin:0px;">'
+                    f'<tr><td style="color:{fg};">{tip}</td></tr></table>')
+            QToolTip.showText(event.globalPos(), html, obj)
+            return True
+        return False
 
 
 class _LabelClickFilter(QObject):
@@ -81,6 +113,7 @@ class ChannelRow(QWidget):
         super().__init__(parent)
         self.trace = trace
         self.scroll_primaries: bool = False  # set by ChannelPanel
+        self._panel_bg: str = "#0d0d0d"     # theme bg — used for tooltip bg
         self.setFixedHeight(32)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         # Let the QListWidgetItem's background brush show through the entire
@@ -127,13 +160,26 @@ class ChannelRow(QWidget):
 
         self.lbl = QLabel(trace.label)
         self.lbl.setFont(QFont("Courier New", 9))
-        self.lbl.setStyleSheet(f"color: {trace.color}; background: transparent;")
+        self.lbl.setStyleSheet(self._lbl_css())
         self.lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
                                 QSizePolicy.Policy.Preferred)
         self.lbl.setToolTip("Click to toggle visibility")
         self.lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lbl_click_filter = _LabelClickFilter(self.chk_vis, self.lbl)
         self.lbl.installEventFilter(self._lbl_click_filter)
+        self._lbl_tip_filter = _TooltipFilter(
+            bg_fn=lambda: self._panel_bg,
+            text_fn=lambda: self.trace.color,
+            parent=self)
+        self.lbl.installEventFilter(self._lbl_tip_filter)
+        # Also cover the top/bottom edges of the row (where no child widget
+        # sits) by installing the same filter on the row widget itself.
+        self.setToolTip("Click to toggle visibility")
+        self._row_tip_filter = _TooltipFilter(
+            bg_fn=lambda: self._panel_bg,
+            text_fn=lambda: self.trace.color,
+            parent=self)
+        self.installEventFilter(self._row_tip_filter)
         layout.addWidget(self.lbl)
 
         btn_del = QPushButton("✕")
@@ -166,22 +212,36 @@ class ChannelRow(QWidget):
         if c.isValid():
             self.trace.set_user_color(c.name())
             self._update_color_btn()
-            self.lbl.setStyleSheet(f"color: {self.trace.color}; background: transparent;")
+            self.lbl.setStyleSheet(self._lbl_css(self.trace.visible))
             self.color_changed.emit(self.trace.name, self.trace.color)
 
     def _toggle_vis(self, state):
         vis = bool(state)
         self.trace.visible = vis
         alpha = "1.0" if vis else "0.35"
-        self.lbl.setStyleSheet(
-            f"color: {self.trace.color}; opacity: {alpha}; background: transparent;")
+        self.lbl.setStyleSheet(self._lbl_css(vis))
         self.visibility_changed.emit(self.trace.name, vis)
 
-    def set_accent_color(self, color: str):
-        """Update the accent colour used for the group stripe."""
+    def _lbl_css(self, visible: bool = True) -> str:
+        """Build the label stylesheet, including a QToolTip background rule.
+
+        The background rule uses the same mechanism that already gives tooltips
+        channel-coloured text: Qt reads the label's own stylesheet for tooltip
+        appearance.  Text colour is left to `color:` (the trace colour) so the
+        channel-colour tooltip text feature is preserved.
+        """
+        alpha = "" if visible else " opacity: 0.35;"
+        return (f"color: {self.trace.color};{alpha} background: transparent;"
+                f" QToolTip {{ background-color: {self._panel_bg};"
+                f" padding: 2px; }}")
+
+    def set_accent_color(self, color: str, panel_bg: str = "#0d0d0d"):
+        """Update the accent colour used for the group stripe and tooltip bg."""
         self._stripe_color = color or "#1e88e5"
+        self._panel_bg = panel_bg
         if bool(self.trace.col_group):
             self.set_grouped(True)   # repaint with new colour
+        self.lbl.setStyleSheet(self._lbl_css(self.trace.visible))
 
     def set_grouped(self, grouped: bool):
         """Apply or remove the group membership visual: left rail, right rail,
@@ -201,7 +261,7 @@ class ChannelRow(QWidget):
 
     def refresh(self):
         self.lbl.setText(self.trace.label)
-        self.lbl.setStyleSheet(f"color: {self.trace.color}; background: transparent;")
+        self.lbl.setStyleSheet(self._lbl_css(self.trace.visible))
         self._update_color_btn()
         self.set_grouped(bool(self.trace.col_group))
 
@@ -304,17 +364,29 @@ class _ChannelGroupHeader(QWidget):
 
         self._btn_all = QPushButton("✓")
         self._btn_all.setFixedSize(22, 22)
-        self._btn_all.setToolTip("Enable all in group  (right-click for more options)")
+        self._btn_all.setToolTip("Enable all in group  (right-click for more)")
         self._btn_all.clicked.connect(
             lambda: [r.chk_vis.setChecked(True) for r in self._rows_ref])
         hl.addWidget(self._btn_all)
 
         self._btn_none = QPushButton("✕")
         self._btn_none.setFixedSize(22, 22)
-        self._btn_none.setToolTip("Disable all in group  (right-click for more options)")
+        self._btn_none.setToolTip("Disable all in group  (right-click for more)")
         self._btn_none.clicked.connect(
             lambda: [r.chk_vis.setChecked(False) for r in self._rows_ref])
         hl.addWidget(self._btn_none)
+
+        # Tooltip colours for this header — updated in set_accent_color.
+        self._tip_bg   = "#0d0d0d"
+        self._tip_text = "#e0e0e0"
+        self._btn_all_tip_filter = _TooltipFilter(
+            bg_fn=lambda: self._tip_bg, text_fn=lambda: self._tip_text,
+            parent=self)
+        self._btn_all.installEventFilter(self._btn_all_tip_filter)
+        self._btn_none_tip_filter = _TooltipFilter(
+            bg_fn=lambda: self._tip_bg, text_fn=lambda: self._tip_text,
+            parent=self)
+        self._btn_none.installEventFilter(self._btn_none_tip_filter)
 
         # Apply default accent (overwritten by panel's set_palette immediately)
         self.set_accent_color("#1e88e5")
@@ -338,8 +410,12 @@ class _ChannelGroupHeader(QWidget):
         """
         darker = QColor(accent).darker(150)
         # Widget is transparent — item-level brush provides the background.
+        # QToolTip rule on a QWidget stylesheet cascades to child widget
+        # tooltips; this is valid for QWidget subclasses (unlike QPushButton).
         self.setStyleSheet(
-            f"background: transparent; border-bottom: 2px solid {darker.name()};")
+            f"background: transparent; border-bottom: 2px solid {darker.name()};"
+            f" QToolTip {{ color: {text}; background-color: {bg};"
+            f" border: 1px solid #808080; padding: 2px; }}")
         # Text = theme bg colour so it contrasts with the accent background.
         text_css = (f"color: {bg}; font-weight: bold; "
                     "background: transparent; border: none;")
@@ -347,15 +423,14 @@ class _ChannelGroupHeader(QWidget):
                      "background: transparent; border: none;")
         self._lbl_arrow.setStyleSheet(arrow_css)
         self._lbl_name.setStyleSheet(text_css)
-        # QToolTip rule on the button's own stylesheet reliably overrides the
-        # app palette for that button's tooltip.  Use theme text/bg so the
-        # tooltip matches every other tooltip in the application.
-        tooltip_css = (f" QToolTip {{ color: {text}; background-color: {bg};"
-                       " border: 1px solid rgba(128,128,128,160); padding: 2px; }}")
         self._btn_all.setStyleSheet(
-            self._BTN.format(fs=13, fg=bg, hfg=accent) + tooltip_css)
+            self._BTN.format(fs=13, fg=bg, hfg=accent))
         self._btn_none.setStyleSheet(
-            self._BTN.format(fs=13, fg=bg, hfg=accent) + tooltip_css)
+            self._BTN.format(fs=13, fg=bg, hfg=accent))
+        # Update stored tooltip colours so the _TooltipFilter lambdas pick
+        # up the new theme values on the next hover.
+        self._tip_bg   = bg
+        self._tip_text = text
 
     # ── Click handling ────────────────────────────────────────────────────────
 
@@ -559,8 +634,8 @@ class ChannelPanel(QWidget):
             self._delete_group_and_channels)
         hdr_widget.set_accent_color(
             self._pv.get("accent", "#1e88e5"),
-            self._pv.get("bg", "#0d0d0d"),
-            self._pv.get("text", "#e0e0e0"))
+            self._pv.get("bg",     "#0d0d0d"),
+            self._pv.get("text",   "#e0e0e0"))
         item = QListWidgetItem()
         item.setData(_GROUP_HEADER_ROLE, group)       # marks it as a group header
         item.setSizeHint(QSize(0, 30))
@@ -590,15 +665,27 @@ class ChannelPanel(QWidget):
         self._apply_button_styles()
         # Propagate accent colour to all existing rows and group headers.
         accent = pv.get("accent", "#1e88e5")
+        bg     = pv.get("bg",     "#0d0d0d")
         for row in self._rows.values():
-            row.set_accent_color(accent)
+            row.set_accent_color(accent, bg)
         for grp_item in self._group_items.values():
             hdr = self._list.itemWidget(grp_item)
             if hdr and hasattr(hdr, "set_accent_color"):
-                hdr.set_accent_color(accent, pv.get("bg", "#0d0d0d"),
+                hdr.set_accent_color(accent, pv.get("bg",   "#0d0d0d"),
                                      pv.get("text", "#e0e0e0"))
         self._update_item_backgrounds()
         self._update_group_separators()
+        # Push a QToolTip background rule into the list widget's stylesheet so
+        # it cascades to all embedded item widgets (channel rows, header bars).
+        # Text colour is intentionally absent — each child's own `color`
+        # property provides it (giving channel-coloured text on trace labels).
+        _bg  = pv.get("bg",     "#0d0d0d")
+        _bdr = pv.get("border", "#2a2a2a")
+        self._list.setStyleSheet(
+            "QListWidget { background: transparent; border: none; }"
+            "QListWidget::item { padding: 0px; }"
+            f"QToolTip {{ background-color: {_bg};"
+            f" border: 1px solid {_bdr}; padding: 2px; }}")
 
     def set_font_scale(self, scale: float):
         """Store scale and rebuild button styles."""
@@ -635,7 +722,8 @@ class ChannelPanel(QWidget):
             self._rows[trace.name].refresh()
             return
         row = ChannelRow(trace)
-        row.set_accent_color(self._pv.get("accent", "#1e88e5"))
+        row.set_accent_color(self._pv.get("accent", "#1e88e5"),
+                             self._pv.get("bg",     "#0d0d0d"))
         row.scroll_primaries = self._scroll_primaries
         row.visibility_changed.connect(self.visibility_changed)
         row.color_changed.connect(self.color_changed)
