@@ -163,17 +163,15 @@ class ChannelRow(QWidget):
         self.lbl.setStyleSheet(self._lbl_css())
         self.lbl.setSizePolicy(QSizePolicy.Policy.Expanding,
                                 QSizePolicy.Policy.Preferred)
-        self.lbl.setToolTip("Click to toggle visibility")
+        # No tooltip on the label itself — the ToolTip event propagates up to
+        # the ChannelRow, whose filter handles it correctly.  Setting a tooltip
+        # here would make Qt use the label's style context (background:
+        # transparent) when rendering the popup, causing a dark-border bleed.
         self.lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self._lbl_click_filter = _LabelClickFilter(self.chk_vis, self.lbl)
         self.lbl.installEventFilter(self._lbl_click_filter)
-        self._lbl_tip_filter = _TooltipFilter(
-            bg_fn=lambda: self._panel_bg,
-            text_fn=lambda: self.trace.color,
-            parent=self)
-        self.lbl.installEventFilter(self._lbl_tip_filter)
-        # Also cover the top/bottom edges of the row (where no child widget
-        # sits) by installing the same filter on the row widget itself.
+        # ChannelRow handles all tooltip events for the whole row via this
+        # filter — covers label area, edges, and any child with no tooltip.
         self.setToolTip("Click to toggle visibility")
         self._row_tip_filter = _TooltipFilter(
             bg_fn=lambda: self._panel_bg,
@@ -223,17 +221,8 @@ class ChannelRow(QWidget):
         self.visibility_changed.emit(self.trace.name, vis)
 
     def _lbl_css(self, visible: bool = True) -> str:
-        """Build the label stylesheet, including a QToolTip background rule.
-
-        The background rule uses the same mechanism that already gives tooltips
-        channel-coloured text: Qt reads the label's own stylesheet for tooltip
-        appearance.  Text colour is left to `color:` (the trace colour) so the
-        channel-colour tooltip text feature is preserved.
-        """
         alpha = "" if visible else " opacity: 0.35;"
-        return (f"color: {self.trace.color};{alpha} background: transparent;"
-                f" QToolTip {{ background-color: {self._panel_bg};"
-                f" padding: 2px; }}")
+        return f"color: {self.trace.color};{alpha} background: transparent;"
 
     def set_accent_color(self, color: str, panel_bg: str = "#0d0d0d"):
         """Update the accent colour used for the group stripe and tooltip bg."""
