@@ -23,6 +23,7 @@ from pytraceview.render_utils import (
     _style_context_from_plot_theme,
     _effective_color,
     _trace_primary_segment_points,
+    _trace_value_at_position,
     _windowed_render_points,
     _interpolated_trace_value,
     _resolve_display_limit,
@@ -477,12 +478,7 @@ class TraceLane(pg.PlotWidget):
             self._cursors[cursor_id].blockSignals(False)
 
     def get_value_at(self, t_pos):
-        for seg in self.trace.segments:
-            t = seg.time + self.trace.time_offset
-            if len(t) >= 2 and float(t[0]) <= t_pos <= float(t[-1]):
-                return _interpolated_trace_value(
-                    t, self.trace.segment_processed(seg), t_pos)
-        return None
+        return _trace_value_at_position(self.trace, t_pos)
 
     # ── Persistence / retrigger overlay ───────────────────────────────────────
 

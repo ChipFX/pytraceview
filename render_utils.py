@@ -14,6 +14,7 @@ Internal helpers (used inside pytraceview only):
   _style_context_from_plot_theme
   _effective_color
   _trace_primary_segment_points  — returns one Segment's display arrays
+  _trace_value_at_position       — cursor/value lookup honoring primary segment
   _windowed_render_points        — clips (t, y) to the visible x range
   _interpolated_trace_value      — linear interp at a cursor position
   _resolve_display_limit
@@ -215,6 +216,34 @@ def _trace_primary_segment_points(
     else:
         seg = trace.segments[0]
     return seg.time + trace.time_offset, trace.segment_processed(seg)
+
+
+def _trace_value_at_position(
+        trace: TraceModel,
+        t_pos: float,
+) -> Optional[float]:
+    """Return the displayed trace value at t_pos, preferring the active primary.
+
+    Multi-segment oscilloscope captures commonly reuse the same trigger-relative
+    time axis for every segment. When a primary segment is selected, that is the
+    solid curve the user is looking at, so value lookup must check it first.
+    """
+    segments = list(trace.segments)
+    primary = trace.primary_segment
+    if primary is not None and 0 <= primary < len(segments):
+        ordered = [segments[primary]]
+        ordered.extend(seg for i, seg in enumerate(segments) if i != primary)
+    else:
+        ordered = segments
+
+    for seg in ordered:
+        t_points = seg.time + trace.time_offset
+        if len(t_points) < 2:
+            continue
+        if float(t_points[0]) <= t_pos <= float(t_points[-1]):
+            return _interpolated_trace_value(
+                t_points, trace.segment_processed(seg), t_pos)
+    return None
 
 
 def _windowed_render_points(
