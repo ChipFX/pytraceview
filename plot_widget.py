@@ -411,12 +411,14 @@ class TraceView(QWidget):
                 visual.refresh_curve(view_range)
             if lane is not None:
                 lane.refresh_curve()
+            self._emit_cursor_values()
             return
 
         if lane is not None:
             lane.refresh_curve()
         if visual is not None:
             visual.refresh_curve(view_range)
+        self._emit_cursor_values()
 
     def update_range_bar(self) -> None:
         self._update_range_bar()
