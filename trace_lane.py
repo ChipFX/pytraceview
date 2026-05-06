@@ -29,6 +29,7 @@ from pytraceview.render_utils import (
     _resolve_display_limit,
     DEFAULT_LIMITS_CONFIG,
     downsample_for_display,
+    strip_nan_for_render,
     sinc_interpolate_to_n,
     cubic_interpolate_to_n,
     _upsample_for_display,
@@ -345,6 +346,7 @@ class TraceLane(pg.PlotWidget):
         vr = self.getPlotItem().viewRange()
         x0, x1 = vr[0]
         t_full, y_full = _windowed_render_points(t_full, y_full, x0, x1)
+        t_full, y_full = strip_nan_for_render(t_full, y_full)
         n_vis = len(t_full)
         # n_vis < 2: widget created before the view range is set — keep full
         # data as fallback; the first real sigRangeChanged redraws correctly.
@@ -361,7 +363,6 @@ class TraceLane(pg.PlotWidget):
                 self._sinc_active = True
 
         self._update_visible_samples()
-
         width_px = float(self.getPlotItem().vb.width())
         max_pts = _resolve_display_limit(self._limits_config, width_px)
         t, y = downsample_for_display(t_full, y_full, max_pts)
@@ -386,6 +387,7 @@ class TraceLane(pg.PlotWidget):
                 t_seg = seg.time + self.trace.time_offset
                 y_seg = self.trace.segment_processed(seg)
                 t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
+                t_seg, y_seg = strip_nan_for_render(t_seg, y_seg)
                 if len(t_seg) < 2:
                     continue
                 t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
@@ -417,6 +419,7 @@ class TraceLane(pg.PlotWidget):
                 t_seg = seg.time + self.trace.time_offset
                 y_seg = self.trace.segment_processed(seg)
                 t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
+                t_seg, y_seg = strip_nan_for_render(t_seg, y_seg)
                 if len(t_seg) < 2:
                     continue
                 t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
@@ -766,6 +769,7 @@ class OverlayTraceVisual:
 
         # Window to visible range first — for all modes.
         t_full, y_full = _windowed_render_points(t_full, y_full, x0, x1)
+        t_full, y_full = strip_nan_for_render(t_full, y_full)
         n_vis = len(t_full)
         # n_vis < 2: widget not yet laid out — keep full data as fallback
 
@@ -803,6 +807,7 @@ class OverlayTraceVisual:
                 t_seg = seg.time + self.trace.time_offset
                 y_seg = self.trace.segment_processed(seg)
                 t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
+                t_seg, y_seg = strip_nan_for_render(t_seg, y_seg)
                 if len(t_seg) < 2:
                     continue
                 t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
@@ -833,6 +838,7 @@ class OverlayTraceVisual:
                 t_seg = seg.time + self.trace.time_offset
                 y_seg = self.trace.segment_processed(seg)
                 t_seg, y_seg = _windowed_render_points(t_seg, y_seg, x0, x1)
+                t_seg, y_seg = strip_nan_for_render(t_seg, y_seg)
                 if len(t_seg) < 2:
                     continue
                 t_ds, y_ds = downsample_for_display(t_seg, y_seg, seg_max_pts)
