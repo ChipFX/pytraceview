@@ -6,7 +6,8 @@ TraceLane, OverlayTraceVisual, and TraceView.
 Public API surface:
   DEFAULT_LIMITS_CONFIG   — default viewport-limit config dict
   TraceStyleContext        — frozen dataclass bundling theme + draw settings
-  downsample_for_display  — min/max decimation for display
+  downsample_for_display  — min/max decimation for display (NaN-safe)
+  strip_nan_for_render    — remove NaN/inf rows before downsampling
   sinc_interpolate_to_n   — bandlimited upsampling via FFT zero-padding
   cubic_interpolate_to_n  — cubic spline upsampling via scipy
 
@@ -14,6 +15,7 @@ Internal helpers (used inside pytraceview only):
   _style_context_from_plot_theme
   _effective_color
   _trace_primary_segment_points  — returns one Segment's display arrays
+  _trace_value_at_position       — cursor/value lookup honoring primary segment
   _windowed_render_points        — clips (t, y) to the visible x range
   _interpolated_trace_value      — linear interp at a cursor position
   _resolve_display_limit
@@ -76,11 +78,15 @@ def downsample_for_display(t, y, max_pts=MAX_DISPLAY_POINTS):
     window = max(1, n // (max_pts // 2))
     n_windows = n // window
     n_use = n_windows * window
-    # Reshape into (n_windows, window) blocks — all argmin/argmax in one numpy call
+    # Reshape into (n_windows, window) blocks — all argmin/argmax in one numpy call.
+    # Replace NaN with ±inf so finite values always beat NaN in comparisons; all-NaN
+    # windows map to the first element (which is NaN and will be compressed later).
     t_w = t[:n_use].reshape(n_windows, window)
     y_w = y[:n_use].reshape(n_windows, window)
-    imin = np.argmin(y_w, axis=1)
-    imax = np.argmax(y_w, axis=1)
+    y_for_min = np.where(np.isnan(y_w), np.inf,  y_w)
+    y_for_max = np.where(np.isnan(y_w), -np.inf, y_w)
+    imin = np.argmin(y_for_min, axis=1)
+    imax = np.argmax(y_for_max, axis=1)
     row = np.arange(n_windows)
     t_min = t_w[row, imin];  y_min = y_w[row, imin]
     t_max = t_w[row, imax];  y_max = y_w[row, imax]
@@ -95,6 +101,23 @@ def downsample_for_display(t, y, max_pts=MAX_DISPLAY_POINTS):
     return t_out, y_out
 
 
+def strip_nan_for_render(t: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return only rows where y is finite, ready for downsampling and setData.
+
+    Applied before downsample_for_display so that sparse traces (a handful of
+    real samples buried in thousands of NaN rows) are never truncated by the
+    reshape-window step and their finite values are not isolated into invisible
+    single-point moveTo segments.  Pyqtgraph then draws straight lines between
+    the real samples at their correct time positions.
+    """
+    if not len(y):
+        return t, y
+    finite = np.isfinite(y)
+    if finite.all():
+        return t, y    # fast path — no NaN present
+    return t[finite], y[finite]
+
+
 def sinc_interpolate_to_n(t: np.ndarray, y: np.ndarray,
                            target_n: int) -> tuple:
     """
@@ -105,6 +128,8 @@ def sinc_interpolate_to_n(t: np.ndarray, y: np.ndarray,
     n = len(y)
     if n < 4 or target_n <= n:
         return t, y
+    if not np.isfinite(y).all():
+        return t, y   # NaN/inf in data — interpolation would corrupt output
     upsample = max(2, (target_n + n - 1) // n)
     n_new = n * upsample
     Y = np.fft.rfft(y)
@@ -131,6 +156,8 @@ def cubic_interpolate_to_n(t: np.ndarray, y: np.ndarray,
     n = len(y)
     if n < 4 or target_n <= n:
         return t, y
+    if not np.isfinite(y).all():
+        return t, y   # NaN/inf in data — spline would corrupt output
     try:
         from scipy.interpolate import CubicSpline
         cs = CubicSpline(t, y, bc_type='not-a-knot')
@@ -215,6 +242,34 @@ def _trace_primary_segment_points(
     else:
         seg = trace.segments[0]
     return seg.time + trace.time_offset, trace.segment_processed(seg)
+
+
+def _trace_value_at_position(
+        trace: TraceModel,
+        t_pos: float,
+) -> Optional[float]:
+    """Return the displayed trace value at t_pos, preferring the active primary.
+
+    Multi-segment oscilloscope captures commonly reuse the same trigger-relative
+    time axis for every segment. When a primary segment is selected, that is the
+    solid curve the user is looking at, so value lookup must check it first.
+    """
+    segments = list(trace.segments)
+    primary = trace.primary_segment
+    if primary is not None and 0 <= primary < len(segments):
+        ordered = [segments[primary]]
+        ordered.extend(seg for i, seg in enumerate(segments) if i != primary)
+    else:
+        ordered = segments
+
+    for seg in ordered:
+        t_points = seg.time + trace.time_offset
+        if len(t_points) < 2:
+            continue
+        if float(t_points[0]) <= t_pos <= float(t_points[-1]):
+            return _interpolated_trace_value(
+                t_points, trace.segment_processed(seg), t_pos)
+    return None
 
 
 def _windowed_render_points(

@@ -38,7 +38,7 @@ from pytraceview.render_utils import (
     TraceStyleContext,
     _style_context_from_plot_theme,
     _effective_color,
-    _interpolated_trace_value,
+    _trace_value_at_position,
     DEFAULT_LIMITS_CONFIG,
 )
 from pytraceview.trace_lane import TraceLane, OverlayTraceVisual
@@ -354,6 +354,79 @@ class TraceView(QWidget):
             self._overlay_widget.hide()
             self._scroll.show()
             self._rebuild_split(inherit_x=(_x0, _x1))
+
+    def display_mode(self) -> str:
+        """Return the active display mode: 'split' or 'overlay'."""
+        return self._mode
+
+    def take_range_bar(self) -> RangeBar:
+        """Detach and return the embedded range bar for host-managed layout."""
+        self._range_bar.setParent(None)
+        return self._range_bar
+
+    def set_range_bar_date_indicator(self, has_date: bool) -> None:
+        self._range_bar.set_date_indicator(has_date)
+
+    def grab_active_plot_area(self):
+        """Grab the currently visible plot area, excluding any host-owned widgets."""
+        if self._mode == "split":
+            return self._scroll.grab()
+        return self._overlay_widget.grab()
+
+    def get_x_axis_item(self):
+        """Return the active bottom X-axis item for status/tick inspection."""
+        if self._mode == "overlay":
+            return self._overlay_widget.getPlotItem().getAxis("bottom")
+        if self._lanes:
+            return next(iter(self._lanes.values())).getPlotItem().getAxis("bottom")
+        return None
+
+    def overlay_plot_item(self):
+        """Return the overlay PlotItem for advanced host integrations."""
+        return self._overlay_widget.getPlotItem()
+
+    def get_lane(self, trace_name: str):
+        return self._lanes.get(trace_name)
+
+    def lane_items(self):
+        return list(self._lanes.values())
+
+    def set_split_redraw_suppressed(self, suppress: bool) -> None:
+        self._set_lanes_suppress(suppress)
+
+    def get_cursor_position(self, cursor_id: int) -> Optional[float]:
+        return self._cursors.get(cursor_id)
+
+    def get_cursor_positions(self) -> Dict[int, Optional[float]]:
+        return dict(self._cursors)
+
+    def refresh_trace_render(self, trace_name: str) -> None:
+        """Refresh one trace's current visual representation in the active mode."""
+        view_range = self.get_current_view_range()
+        lane = self._lanes.get(trace_name)
+        visual = self._overlay_visuals.get(trace_name)
+
+        if self._mode == "overlay":
+            if visual is not None:
+                visual.refresh_curve(view_range)
+            if lane is not None:
+                lane.refresh_curve()
+            self._emit_cursor_values()
+            return
+
+        if lane is not None:
+            lane.refresh_curve()
+        if visual is not None:
+            visual.refresh_curve(view_range)
+        self._emit_cursor_values()
+
+    def update_range_bar(self) -> None:
+        self._update_range_bar()
+
+    def scroll_trace_list(self, delta_px: int) -> None:
+        """Scroll the split trace list vertically by a pixel delta."""
+        sb = self._scroll.verticalScrollBar()
+        sb.setValue(sb.value() + int(delta_px))
 
     def get_cursor_placement_x(self, cursor_id: int) -> float:
         x0, x1 = self.get_current_view_range()
@@ -1160,15 +1233,9 @@ class TraceView(QWidget):
                     if v is not None:
                         vals[trace.name] = v
                 else:
-                    # Overlay mode: search each segment for the cursor position
-                    for seg in trace.segments:
-                        t = seg.time + trace.time_offset
-                        if len(t) >= 2 and float(t[0]) <= t_pos <= float(t[-1]):
-                            v = _interpolated_trace_value(
-                                t, trace.segment_processed(seg), t_pos)
-                            if v is not None:
-                                vals[trace.name] = v
-                            break
+                    v = _trace_value_at_position(trace, t_pos)
+                    if v is not None:
+                        vals[trace.name] = v
             result[cid] = vals
         self.cursor_values_changed.emit(result)
 
